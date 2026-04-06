@@ -60,7 +60,7 @@ except ImportError:
         _write_bak(path)
         with open(path, "a", encoding="utf-8") as f: f.write("\n" + content)
         return "appended"
-    def cleanup_stale_drafts(days=3): pass
+    def cleanup_stale_drafts(days_to_keep=3): pass
     def create_backup():
         import shutil, time
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
