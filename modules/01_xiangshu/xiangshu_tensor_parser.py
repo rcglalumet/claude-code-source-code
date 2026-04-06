@@ -1,185 +1,241 @@
 # -*- coding: utf-8 -*-
 # = [端口 P: L1 降维 Parser] =
 # 路径: modules/01_xiangshu/xiangshu_tensor_parser.py
-# @Layer: 🔌 [L1] 象数派降维 Parser（Dumb Tool）
-# @Description: 解析外部原始请求，将非结构化输入映射为 XiangShuGraph 拓扑实体。
-#               绝对禁止包含 if/else 推演断语或 LLM 调用。
-#               所有逻辑仅限于：字段提取、类型转换、白名单过滤、宫位坐标映射。
+# @Layer: [L1] 象数派降维 Parser（绝对 Dumb Tool）
+# @Description:
+#   将 VLM 上游的 11 维象数载荷 JSON 反序列化为 XiangShuGraph。
+#   核心原则：直接利用 Pydantic model_validate 进行反序列化，禁止一切猜测逻辑。
+#   Parser 唯一允许的操作：
+#     1. JSON key 的静态别名映射（alias）
+#     2. palace 字符串 -> palace_index 的 O(1) 静态查表
+#     3. relation_type -> relation_score 的 O(1) 静态查表
+#     4. 白名单背景节点的 O(1) frozenset 过滤
+#   严禁：if/else 推演断语、LLM 调用、语义猜测、任何业务判断。
 
 import logging
 from typing import Any, Dict, List
 
 from xiangshu_v102_topology import (
+    ArrayOrientationDim,
+    AsymmetricHeightDim,
+    ColorShapePiercingDim,
+    CornerJammingDim,
+    FluidDensityDim,
+    FluidSoaking3DDim,
+    GestaltMimicryDim,
+    GranularPhysicsDim,
+    PhysicalTiltDim,
+    SurfaceAgingDim,
+    TruncationDim,
     XiangShuEdge,
     XiangShuGraph,
     XiangShuNode,
 )
 from expert_rules.xiangshu_rules import XIANGSHU_WHITELIST_KEYWORDS
-from core_engine.xiangshu_math_core import pixel_to_palace_index, relation_to_score
+from core_engine.xiangshu_math_core import relation_to_score
 
-logger = logging.getLogger("L1_XiangShu_Parser")
+logger = logging.getLogger("L1_XiangShu_Parser_V11")
 
 # ==============================================================================
-# 白名单关键词集合（O(1) 查找）
+# [静态常数] 白名单关键词集合（O(1) 查找）
 # ==============================================================================
-_WHITELIST_SET = frozenset(kw.lower() for kw in XIANGSHU_WHITELIST_KEYWORDS)
+_WHITELIST_SET: frozenset = frozenset(kw.lower() for kw in XIANGSHU_WHITELIST_KEYWORDS)
 
-# 画像分类标签静态映射表（口语 -> 英文标量，O(1) 查表）
-_AVATAR_CATEGORY_MAP: Dict[str, str] = {
-    "真人":        "real_photo",
-    "real":        "real_photo",
-    "photo":       "real_photo",
-    "动漫":        "anime_manga",
-    "anime":       "anime_manga",
-    "manga":       "anime_manga",
-    "漫画":        "anime_manga",
-    "风景":        "misc_landscape",
-    "landscape":   "misc_landscape",
-    "孤物":        "isolated_object",
-    "isolated":    "isolated_object",
-    "object":      "isolated_object",
-    "group":       "group_photo",
-    "合照":        "group_photo",
-    "多人":        "group_photo",
+# ==============================================================================
+# [静态常数] 文王八卦宫位名 -> 洛书九宫格 index 映射（O(1) 查表）
+# 布局依据：洛书标准数字宫位
+# ==============================================================================
+_PALACE_TO_INDEX: Dict[str, int] = {
+    "GEN":    1,   # 艮（东北）-> 左上
+    "KAN":    2,   # 坎（北）  -> 上中
+    "XUN":    3,   # 巽（东南）-> 右上
+    "ZHEN":   4,   # 震（东）  -> 左中
+    "CENTER": 5,   # 中宫      -> 正中
+    "DUI":    6,   # 兑（西）  -> 右中
+    "KUN":    7,   # 坤（西南）-> 左下
+    "LI":     8,   # 离（南）  -> 下中
+    "QIAN":   9,   # 乾（西北）-> 右下
+}
+
+# ==============================================================================
+# [静态常数] engine_topology.edges[] 中 JSON key "source_id" 别名映射
+# VLM 产出的边字段名可能为 source_id 或 source，统一为 source_id
+# ==============================================================================
+_EDGE_KEY_ALIASES: Dict[str, str] = {
+    "source":    "source_id",
+    "target":    "target_id",
+    "relation":  "relation_type",
 }
 
 
-def _map_avatar_category(raw: str) -> str:
-    """将口语分类字符串映射为英文标量（O(1) 查表，fallback 为 'real_photo'）。"""
-    return _AVATAR_CATEGORY_MAP.get(raw.strip().lower(), "real_photo")
-
-
-def _is_background_node(label: str, properties: List[str]) -> bool:
-    """判断节点是否属于白名单背景节点（O(1) 集合查找）。"""
-    if label.lower() in _WHITELIST_SET:
-        return True
-    return any(p.lower() in _WHITELIST_SET for p in properties)
-
-
-def _extract_properties(raw_props: Any) -> List[str]:
-    """从各类原始格式中安全提取属性列表（纯工具函数，无推演）。"""
-    if isinstance(raw_props, list):
-        return [str(p) for p in raw_props if p]
-    if isinstance(raw_props, str):
-        return [p.strip() for p in raw_props.split(",") if p.strip()]
-    if isinstance(raw_props, dict):
-        return [str(v) for v in raw_props.values() if v]
-    return []
-
-
-def _parse_node(node_id: str, raw_node: Dict[str, Any]) -> XiangShuNode:
+# ==============================================================================
+# [内部工具] 节点原始数据规范化（仅做 key 映射 + 类型转换，零推演）
+# ==============================================================================
+def _normalize_node_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
-    将单个原始节点字典解析为 XiangShuNode。
-    严禁推演，仅做字段提取与类型转换。
+    将原始节点字典规范化为 XiangShuNode.model_validate 可直接消费的格式。
+    仅处理：字段别名（id -> node_id via alias）、palace_index 查表、
+    is_background 白名单过滤。
     """
-    label = str(raw_node.get("label", raw_node.get("type", "unknown")))
-    x_norm = float(raw_node.get("x_norm", raw_node.get("x", 0.5)))
-    y_norm = float(raw_node.get("y_norm", raw_node.get("y", 0.5)))
-    x_norm = max(0.0, min(1.0, x_norm))
-    y_norm = max(0.0, min(1.0, y_norm))
-    palace_index = pixel_to_palace_index(x_norm, y_norm)
+    normalized = dict(raw)
 
-    raw_props = raw_node.get("properties", raw_node.get("attributes", []))
-    properties = _extract_properties(raw_props)
+    # palace -> palace_index（O(1) 查表）
+    palace_raw = str(normalized.get("palace", "CENTER")).upper()
+    normalized["palace_index"] = _PALACE_TO_INDEX.get(palace_raw, 5)
+    normalized["palace"] = palace_raw
 
-    is_primary = bool(raw_node.get("is_primary_subject", False))
-    is_bg = _is_background_node(label, properties)
-
-    return XiangShuNode(
-        node_id=node_id,
-        label=label,
-        palace_index=palace_index,
-        x_norm=x_norm,
-        y_norm=y_norm,
-        properties=properties,
-        is_primary_subject=is_primary,
-        is_background=is_bg,
+    # 白名单背景检测（O(1) frozenset 查找）
+    label = str(normalized.get("concept", normalized.get("label", ""))).lower()
+    props: List[str] = normalized.get("properties", [])
+    normalized["is_background"] = (
+        label in _WHITELIST_SET
+        or any(p.lower() in _WHITELIST_SET for p in props)
     )
+    normalized["is_primary_subject"] = False
+
+    # Pydantic alias 要求：XiangShuNode 用 alias="id"，model_validate 时传 "id"
+    # 确保 "id" 字段存在（VLM 可能用 "id" 或 "node_id"）
+    if "id" not in normalized and "node_id" in normalized:
+        normalized["id"] = normalized["node_id"]
+
+    return normalized
 
 
-def _parse_edge(raw_edge: Dict[str, Any]) -> XiangShuEdge:
+# ==============================================================================
+# [内部工具] 边原始数据规范化（仅做 key 映射 + relation_score 查表，零推演）
+# ==============================================================================
+def _normalize_edge_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
-    将单个原始边字典解析为 XiangShuEdge。
-    relation_type 通过 O(1) 查表映射为量化分数，无推演。
+    将原始边字典规范化为 XiangShuEdge.model_validate 可直接消费的格式。
+    仅处理：字段别名映射、relation_score O(1) 查表。
     """
-    source_id = str(raw_edge.get("source", raw_edge.get("from", "")))
-    target_id = str(raw_edge.get("target", raw_edge.get("to", "")))
-    relation_type = str(raw_edge.get("relation", raw_edge.get("type", "NONE"))).upper()
-    score = relation_to_score(relation_type)
+    normalized: Dict[str, Any] = {}
+    for k, v in raw.items():
+        canonical_key = _EDGE_KEY_ALIASES.get(k, k)
+        normalized[canonical_key] = v
 
-    return XiangShuEdge(
-        source_id=source_id,
-        target_id=target_id,
-        relation_type=relation_type,
-        relation_score=score,
-    )
+    # relation_score O(1) 查表
+    relation_type = str(normalized.get("relation_type", "NONE")).upper()
+    normalized["relation_type"] = relation_type
+    normalized["relation_score"] = relation_to_score(relation_type)
+    normalized.setdefault("context", "")
+
+    return normalized
 
 
+# ==============================================================================
+# [对外接口] 主解析函数：VLM 11 维 Payload -> XiangShuGraph
+# 核心：直接调用 model_validate，禁止一切推演猜测。
+# ==============================================================================
 def parse_vlm_payload(raw_payload: Dict[str, Any]) -> XiangShuGraph:
     """
-    [对外接口] 将 VLM 上游的原始 JSON Payload 解析为 XiangShuGraph。
+    [绝对 Dumb Tool] 将 VLM 11 维象数载荷 JSON 反序列化为 XiangShuGraph。
 
-    期望的 raw_payload 结构（字段名允许多种口语变体）：
+    预期 raw_payload 顶层结构：
     {
-        "image_id": "img_001",
-        "nodes": {
-            "N001": {"label": "person", "x_norm": 0.5, "y_norm": 0.5,
-                     "properties": ["back_of_head", "blurry"], "is_primary_subject": true},
-            ...
-        },
-        "edges": [
-            {"source": "N001", "target": "N002", "relation": "DIVIDES"},
-            ...
-        ],
-        "avatar_category": "real_photo",
-        "crop_slant_degrees": 0.0
+        "gestalt_mimicry_and_text_decomposition": { ... },
+        "truncation_and_interior_mapping":         { ... },
+        "surface_aging_and_neatness":              { ... },
+        "array_orientation_and_protrusion":        { ... },
+        "physical_tilt_and_exposed_facet":         { ... },
+        "asymmetrical_height_disparity":           { ... },
+        "fluid_density_matching_and_migration":    { ... },
+        "granular_physics_and_edge_sharpness":     { ... },
+        "corner_jamming_and_turbulence":           { ... },
+        "fluid_soaking_and_3d_stacking":           { ... },
+        "color_shape_taste_and_piercing":          { ... },
+        "engine_topology": {
+            "nodes": [ {"id": ..., "palace": ..., "properties": [...]} ],
+            "edges": [ {"source_id": ..., "target_id": ..., "relation": ...} ]
+        }
     }
     """
-    image_id = str(raw_payload.get("image_id", "unknown"))
+    # --- [1] 11 维度 model_validate（直接反序列化，零猜测）---
+    gestalt_mimicry = GestaltMimicryDim.model_validate(
+        raw_payload.get("gestalt_mimicry_and_text_decomposition", {})
+    )
+    truncation = TruncationDim.model_validate(
+        raw_payload.get("truncation_and_interior_mapping", {})
+    )
+    surface_aging = SurfaceAgingDim.model_validate(
+        raw_payload.get("surface_aging_and_neatness", {})
+    )
+    array_orientation = ArrayOrientationDim.model_validate(
+        raw_payload.get("array_orientation_and_protrusion", {})
+    )
+    physical_tilt = PhysicalTiltDim.model_validate(
+        raw_payload.get("physical_tilt_and_exposed_facet", {})
+    )
+    asymmetric_height = AsymmetricHeightDim.model_validate(
+        raw_payload.get("asymmetrical_height_disparity", {})
+    )
+    fluid_density = FluidDensityDim.model_validate(
+        raw_payload.get("fluid_density_matching_and_migration", {})
+    )
+    granular_physics = GranularPhysicsDim.model_validate(
+        raw_payload.get("granular_physics_and_edge_sharpness", {})
+    )
+    corner_jamming = CornerJammingDim.model_validate(
+        raw_payload.get("corner_jamming_and_turbulence", {})
+    )
+    fluid_soaking_3d = FluidSoaking3DDim.model_validate(
+        raw_payload.get("fluid_soaking_and_3d_stacking", {})
+    )
+    color_shape_piercing = ColorShapePiercingDim.model_validate(
+        raw_payload.get("color_shape_taste_and_piercing", {})
+    )
 
-    # 节点解析
-    raw_nodes = raw_payload.get("nodes", {})
-    if isinstance(raw_nodes, list):
-        raw_nodes = {str(i): n for i, n in enumerate(raw_nodes)}
+    # --- [2] engine_topology: nodes + edges ---
+    topology_raw = raw_payload.get("engine_topology", {})
 
+    raw_nodes_list: List[Dict[str, Any]] = topology_raw.get("nodes", [])
     nodes: Dict[str, XiangShuNode] = {}
     primary_subject_id = ""
-    for nid, rn in raw_nodes.items():
+    for rn in raw_nodes_list:
         if not isinstance(rn, dict):
             continue
-        node = _parse_node(nid, rn)
-        nodes[nid] = node
-        if node.is_primary_subject and not primary_subject_id:
-            primary_subject_id = nid
+        normalized = _normalize_node_dict(rn)
+        node = XiangShuNode.model_validate(normalized)
+        nodes[node.node_id] = node
 
-    # 边解析
-    raw_edges = raw_payload.get("edges", [])
+    raw_edges_list: List[Dict[str, Any]] = topology_raw.get("edges", [])
     edges: List[XiangShuEdge] = []
-    for re in raw_edges:
-        if isinstance(re, dict):
-            edges.append(_parse_edge(re))
+    for re in raw_edges_list:
+        if not isinstance(re, dict):
+            continue
+        normalized_edge = _normalize_edge_dict(re)
+        edges.append(XiangShuEdge.model_validate(normalized_edge))
 
-    # 元信息解析
-    avatar_category = _map_avatar_category(
-        str(raw_payload.get("avatar_category", "real"))
-    )
-    has_multiple = bool(raw_payload.get("has_multiple_subjects", False))
-    is_inverted = bool(raw_payload.get("is_inverted", False))
-    crop_slant = float(raw_payload.get("crop_slant_degrees", 0.0))
+    # --- [3] 元数据直接透传（tilt_degrees -> crop_slant_degrees）---
+    tilt_degrees = physical_tilt.tilt_degrees
+    is_inverted = fluid_soaking_3d.dimension_fold_present
+
+    image_id = str(raw_payload.get("image_id", "unknown"))
+    avatar_category = str(raw_payload.get("avatar_category", "misc_landscape"))
 
     graph = XiangShuGraph(
         image_id=image_id,
+        gestalt_mimicry=gestalt_mimicry,
+        truncation=truncation,
+        surface_aging=surface_aging,
+        array_orientation=array_orientation,
+        physical_tilt=physical_tilt,
+        asymmetric_height=asymmetric_height,
+        fluid_density=fluid_density,
+        granular_physics=granular_physics,
+        corner_jamming=corner_jamming,
+        fluid_soaking_3d=fluid_soaking_3d,
+        color_shape_piercing=color_shape_piercing,
         nodes=nodes,
         edges=edges,
         primary_subject_id=primary_subject_id,
         avatar_category=avatar_category,
-        has_multiple_subjects=has_multiple,
         is_inverted=is_inverted,
-        crop_slant_degrees=crop_slant,
+        crop_slant_degrees=tilt_degrees,
     )
 
     logger.debug(
-        "[Parser] image_id=%s nodes=%d edges=%d primary=%s",
-        image_id, len(nodes), len(edges), primary_subject_id,
+        "[Parser V11] image_id=%s nodes=%d edges=%d",
+        image_id, len(nodes), len(edges),
     )
     return graph
